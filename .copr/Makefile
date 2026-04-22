@@ -11,6 +11,7 @@ fedoraver   := $(shell sed -n 's/.*Fedora release \([^ ]*\).*/\1/p' /etc/fedora-
 # Runs in the root
 srpm:
 	echo Yo
+	dnf install git
 	ls -la
 	find .
 	cat /etc/fedora-release
