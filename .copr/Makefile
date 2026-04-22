@@ -11,6 +11,10 @@ fedoraver   := $(shell sed -n 's/.*Fedora release \([^ ]*\).*/\1/p' /etc/fedora-
 # Runs in the root
 srpm:
 	echo Yo
+	ls -la
+	find .
+	cat /etc/fedora-release
+	git log
 
 	mkdir -p ${curpwd}/.tmp/nct6687d-1.0.${commitcount}/nct6687d
 	cp LICENSE Makefile nct6687.c ${curpwd}/.tmp/nct6687d-1.0.${commitcount}/nct6687d
