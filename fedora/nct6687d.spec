@@ -2,6 +2,8 @@
 %global pkgver MAKEFILE_PKGVER
 %global commithash MAKEFILE_COMMITHASH
 
+%{!?_modulesloaddir: %global _modulesloaddir /usr/lib/modules-load.d}
+
 Name:           nct6687d
 Version:        1.0.%{pkgver}
 Release:        git%{commithash}
