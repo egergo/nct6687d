@@ -8,28 +8,8 @@ fedoraver   := $(shell sed -n 's/.*Fedora release \([^ ]*\).*/\1/p' /etc/fedora-
 
 # Runs in the root
 srpm: install-git
-	# echo Yo
-
-	# dnf install -y git
-
-	# ls -la
-	# find .
-	# cat /etc/fedora-release
-	# git log
-
-	$(MAKE) -v
-
-	git rev-list --all --count
-	git rev-parse --short HEAD
-
-	$(info commitcount := $$(shell git rev-list --all --count 2>/dev/null))
-	$(info commithash  := $$(shell git rev-parse --short HEAD 2>/dev/null))
-
 	$(eval commitcount := $$(shell git rev-list --all --count 2>/dev/null))
 	$(eval commithash  := $$(shell git rev-parse --short HEAD 2>/dev/null))
-
-	echo $(commithash)
-	echo $(commitcount)
 
 	mkdir -p ${curpwd}/.tmp/nct6687d-1.0.${commitcount}/nct6687d
 	cp LICENSE Makefile nct6687.c ${curpwd}/.tmp/nct6687d-1.0.${commitcount}/nct6687d
@@ -44,9 +24,7 @@ srpm: install-git
 	# rpmbuild -bs --define "_topdir ${curpwd}/.tmp/rpmbuild" ${curpwd}/.tmp/rpmbuild/SPECS/nct6687d.spec
 	rpmbuild -bs --define "_topdir ${curpwd}/.tmp/rpmbuild" ${curpwd}/.tmp/rpmbuild/SPECS/*.spec
 
-
-	# $(MAKE) akmod/build
-	# cp .tmp/rpmbuild/SRPMS/*.src.rpm $(outdir)
+	cp .tmp/rpmbuild/SRPMS/*.src.rpm $(outdir)
 
 install-git:
 	dnf install -y git
