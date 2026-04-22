@@ -22,11 +22,11 @@ srpm:
 	git rev-list --all --count
 	git rev-parse --short HEAD
 
-	$(info commitcount := $(shell git rev-list --all --count 2>/dev/null))
-	$(info commithash  := $(shell git rev-parse --short HEAD 2>/dev/null))
+	$(info commitcount := $$(shell git rev-list --all --count 2>/dev/null))
+	$(info commithash  := $$(shell git rev-parse --short HEAD 2>/dev/null))
 
-	$(eval commitcount := $(shell git rev-list --all --count 2>/dev/null))
-	$(eval commithash  := $(shell git rev-parse --short HEAD 2>/dev/null))
+	$(eval commitcount := $$(shell git rev-list --all --count 2>/dev/null))
+	$(eval commithash  := $$(shell git rev-parse --short HEAD 2>/dev/null))
 
 	echo $(commithash)
 	echo $(commitcount)
