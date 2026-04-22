@@ -36,3 +36,5 @@ install -D -m 0644 %{SOURCE0} %{buildroot}%{_modulesloaddir}/nct6687.conf
 %changelog
 * Wed Jan 04 2023 Frederic BOLTZ <frederic.boltz@gmail.com> - %{version}
 - Initial package
+
+{{{ git_dir_changelog }}}
