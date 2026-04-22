@@ -10,13 +10,15 @@ fedoraver   := $(shell sed -n 's/.*Fedora release \([^ ]*\).*/\1/p' /etc/fedora-
 srpm:
 	# echo Yo
 
-	# dnf install -y git
+	dnf install -y git
 
 	# ls -la
 	# find .
 	# cat /etc/fedora-release
 	# git log
 
+	git rev-list --all --count
+	git rev-parse --short HEAD
 
 	$(eval commitcount := $(shell git rev-list --all --count 2>/dev/null))
 	$(eval commithash  := $(shell git rev-parse --short HEAD 2>/dev/null))
