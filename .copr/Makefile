@@ -21,11 +21,11 @@ srpm: install-git
 	cp $(spec) ${curpwd}/.tmp/rpmbuild/SPECS/
 	sed -i "s/MAKEFILE_PKGVER/${commitcount}/g" ${curpwd}/.tmp/rpmbuild/SPECS/*
 	sed -i "s/MAKEFILE_COMMITHASH/${commithash}/g" ${curpwd}/.tmp/rpmbuild/SPECS/*
-	rpmbuild -ba --define "_topdir ${curpwd}/.tmp/rpmbuild" ${curpwd}/.tmp/rpmbuild/SPECS/*.spec
+	rpmbuild -bs --define "_topdir ${curpwd}/.tmp/rpmbuild" ${curpwd}/.tmp/rpmbuild/SPECS/*.spec
 
-	cp -r ${curpwd}/.tmp/* $(outdir)
+	# cp -r ${curpwd}/.tmp/* $(outdir)
 
-	# cp .tmp/rpmbuild/SRPMS/*.src.rpm $(outdir)
+	cp .tmp/rpmbuild/SRPMS/*.src.rpm $(outdir)
 	# cp .tmp/rpmbuild/SRPMS/*.src.rpm $(outdir)
 
 install-git:

@@ -3,6 +3,8 @@
 %global debug_package %{nil}
 %endif
 
+%{!?_modulesloaddir: %global _modulesloaddir /usr/lib/modules-load.d}
+
 %global prjname nct6687d
 %global pkgver MAKEFILE_PKGVER
 %global commithash MAKEFILE_COMMITHASH

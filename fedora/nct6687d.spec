@@ -1,3 +1,4 @@
+%global prjname nct6687d
 %global pkgver MAKEFILE_PKGVER
 %global commithash MAKEFILE_COMMITHASH
 
