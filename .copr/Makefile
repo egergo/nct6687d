@@ -9,7 +9,9 @@ fedoraver   := $(shell sed -n 's/.*Fedora release \([^ ]*\).*/\1/p' /etc/fedora-
 # Runs in the root
 srpm:
 	# echo Yo
-	dnf install -y git
+
+	# dnf install -y git
+
 	# ls -la
 	# find .
 	# cat /etc/fedora-release
@@ -18,6 +20,9 @@ srpm:
 
 	$(eval commitcount := $(shell git rev-list --all --count 2>/dev/null))
 	$(eval commithash  := $(shell git rev-parse --short HEAD 2>/dev/null))
+
+	echo $(commithash)
+	echo $(commitcount)
 
 	mkdir -p ${curpwd}/.tmp/nct6687d-1.0.${commitcount}/nct6687d
 	cp LICENSE Makefile nct6687.c ${curpwd}/.tmp/nct6687d-1.0.${commitcount}/nct6687d
