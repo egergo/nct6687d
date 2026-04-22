@@ -21,10 +21,12 @@ srpm: install-git
 	cp $(spec) ${curpwd}/.tmp/rpmbuild/SPECS/
 	sed -i "s/MAKEFILE_PKGVER/${commitcount}/g" ${curpwd}/.tmp/rpmbuild/SPECS/*
 	sed -i "s/MAKEFILE_COMMITHASH/${commithash}/g" ${curpwd}/.tmp/rpmbuild/SPECS/*
-	# rpmbuild -bs --define "_topdir ${curpwd}/.tmp/rpmbuild" ${curpwd}/.tmp/rpmbuild/SPECS/nct6687d.spec
-	rpmbuild -bs --define "_topdir ${curpwd}/.tmp/rpmbuild" ${curpwd}/.tmp/rpmbuild/SPECS/*.spec
+	rpmbuild -ba --define "_topdir ${curpwd}/.tmp/rpmbuild" ${curpwd}/.tmp/rpmbuild/SPECS/*.spec
 
-	cp .tmp/rpmbuild/SRPMS/*.src.rpm $(outdir)
+	cp -r ${curpwd}/.tmp/* $(outdir)
+
+	# cp .tmp/rpmbuild/SRPMS/*.src.rpm $(outdir)
+	# cp .tmp/rpmbuild/SRPMS/*.src.rpm $(outdir)
 
 install-git:
 	dnf install -y git
