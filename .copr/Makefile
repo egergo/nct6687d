@@ -7,10 +7,10 @@ fedoraver   := $(shell sed -n 's/.*Fedora release \([^ ]*\).*/\1/p' /etc/fedora-
 # make -f .copr/Makefile srpm outdir=".out" spec="fedora/nct6687d.spec"
 
 # Runs in the root
-srpm:
+srpm: install-git
 	# echo Yo
 
-	dnf install -y git
+	# dnf install -y git
 
 	# ls -la
 	# find .
@@ -47,3 +47,6 @@ srpm:
 
 	# $(MAKE) akmod/build
 	# cp .tmp/rpmbuild/SRPMS/*.src.rpm $(outdir)
+
+install-git:
+	dnf install -y git
