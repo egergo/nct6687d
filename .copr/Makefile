@@ -29,4 +29,4 @@ srpm: install-git
 	# cp .tmp/rpmbuild/SRPMS/*.src.rpm $(outdir)
 
 install-git:
-	dnf install -y git
+	dnf install -y git elfutils-libelf-devel gcc kmodtool
