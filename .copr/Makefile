@@ -10,7 +10,7 @@ srpm: install-git
 	$(eval commithash  := $$(shell git rev-parse --short HEAD 2>/dev/null))
 
 	mkdir -p ${curpwd}/.tmp/nct6687d-1.0.${commitcount}/nct6687d
-	cp LICENSE Makefile nct6687.c ${curpwd}/.tmp/nct6687d-1.0.${commitcount}/nct6687d
+	cp LICENSE Makefile Kbuild nct6687.c ${curpwd}/.tmp/nct6687d-1.0.${commitcount}/nct6687d
 	cd .tmp && tar -czvf nct6687d-1.0.${commitcount}.tar.gz nct6687d-1.0.${commitcount} && cd -
 
 	mkdir -p ${curpwd}/.tmp/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
