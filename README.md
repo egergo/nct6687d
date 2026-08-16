@@ -210,12 +210,50 @@ chip "nct6687-*"
   For MSI motherboards with `msi_alt1` configuration: When enabled, writes PWM values to all 7 fan 
   curve control points. This may help with fan control on some MSI boards where standard PWM writes 
   don't take effect immediately. Only affects system fans controlled by the BIOS. Not the CPU fan or pump fan. 
+
+  Before entering manual control, the driver saves all 7 original curve points. The saved curve is
+  restored when userspace writes automatic mode to `pwmN_enable`, when the driver is unloaded, or
+  when the optional fan-control watchdog expires.
   
   This implementation is based on register mappings from [LibreHardwareMonitor](https://github.com/LibreHardwareMonitor/LibreHardwareMonitor).
   
   Usage: `modprobe nct6687 msi_fan_brute_force=1`
 
+  With this option enabled, the hwmon device exposes `fan_control_watchdog`. Writing a timeout from
+  1 to 300 seconds arms or refreshes a manual-control lease. If the lease expires, every channel
+  changed since the last automatic-mode request is restored to its original curve and control mode.
+  Writing `0` disarms the watchdog. A controlling daemon should refresh the lease independently of
+  PWM value changes and disarm it only after returning all channels to automatic control. The lease
+  is paused while the system is suspended and resumes with its remaining time after the device is
+  active again.
+
   Note: This option requires blacklisting the `nct6683` module to prevent it from loading instead of `nct6687`. See the [Issues](#issues) section for detailed instructions.
+
+- **fan_mask** (uint) (default: all channels, `0xff`)
+  Bitmask of the fan/pwm channels to expose. Bit 0 controls `fan1`/`pwm1`, bit 1
+  controls `fan2`/`pwm2`, and so on up to bit 7 for `fan8`/`pwm8`. Both the
+  tachometer and PWM attributes of a channel are covered by the same bit, since
+  `fanN_input` and `pwmN` are the same physical header.
+
+  Useful on boards with fewer than 8 headers, where the unused channels report a
+  constant 0 RPM.
+
+- **temp_mask** (uint) (default: all channels, `0x7f`)
+  Bitmask of the temperature channels to expose. Bit 0 controls `temp1`, up to
+  bit 6 for `temp7`. Useful for hiding channels the board does not populate.
+
+  Both masks accept decimal or `0x` hex. Masked channels are not read from the EC
+  at all, and channel numbering is never renumbered to fill gaps: masking off
+  bit 1 leaves `fan1` and `fan3`–`fan8` with no `fan2`, so existing `sensors.d`
+  and `fancontrol` configuration keeps referring to the same hardware.
+
+  Examples:
+
+  ```
+  # fan1-fan6 and pwm1-pwm6 only, fan7/fan8/pwm7/pwm8 hidden
+  # temp1-temp4 only, temp5/temp6/temp7 hidden
+      options nct6687 fan_mask=0x3f temp_mask=0x0f
+  ```
 
 <details>
   <summary>Supported MSI boards for ("msi_alt1" and "msi_fan_brute_force")</summary>
@@ -308,13 +346,14 @@ echo 255 > pwm6
 
 ### `pwm[1-8]_enable`
 
-Gets/sets controls mode of fan/temperature control.
+Gets/sets the fan control mode.
 
 Accepted values:
  * `1` - manual speed management through `pwm[1-8]`
- * `99` - whatever automatic mode was configured by firmware
-          (this is a deliberately weird value to be dropped after adding more
-           modes)
+ * `2` - automatic control using the profile configured by firmware
+
+The legacy value `99` is still accepted when written for compatibility, but
+reading `pwm[1-8]_enable` always reports the standard hwmon value `1` or `2`.
 
 Example:
 
@@ -322,11 +361,11 @@ Example:
 # fix a fan at current speed (`echo pwm6` will be constant from now on)
 echo 1 > pwm6_enable
 # switch back to automatic control set up by firmware (`echo pwm6` is again dynamic after this)
-echo 99 > pwm6_enable
+echo 2 > pwm6_enable
 # switch to ~25% of max speed
 echo 64 > pwm6
 # automatic
-echo 99 > pwm6_enable
+echo 2 > pwm6_enable
 # back to ~25% (it seems to be remembered)
 echo 1 > pwm6_enable
 ```
@@ -375,6 +414,25 @@ On MSI motherboards, `msi_alt1` configuration is automatically detected and enab
 You can verify this in `dmesg` after loading the module:
 ```
 nct6687 nct6687.2592: Detected MSI board; using alternative fan configuration (msi_alt1)
+nct6687 nct6687.2592: active fan config=msi_alt1, SYS_FAN reg_rpm=0x015E/0x015C/0x015A
 ```
 
+The second line is always printed and shows the EC offsets the driver reads
+for SYS_FAN #1/#2/#3. Use it to confirm the right mapping is active.
+
 If you have a non-MSI motherboard with this issue, try using module parameter `fan_config=msi_alt1` manually.
+
+> **Warning — do NOT force `fan_config=msi_alt1` on non-listed MSI boards.**
+> Only the NCT6687DR-equipped MSI families (B840/B850/X870/X870E/Z890) are
+> compatible with `msi_alt1`. Earlier MSI series with the plain NCT6687D chip
+> — including **B650/B660/X670/Z690/Z790** — use the *default* register
+> mapping and are auto-detected correctly without any module parameter.
+>
+> If you previously set `options nct6687 fan_config=msi_alt1` in
+> `/etc/modprobe.d/` on one of those boards as a troubleshooting attempt,
+> remove it: forcing `msi_alt1` makes the driver read EC offsets
+> `0x154-0x15E` which are zero on non-DR variants, causing all SYS_FAN to
+> report `0 RPM` while CPU_FAN keeps working. The `active fan config=...`
+> dmesg line above will reveal a stale forced setting at a glance.
+>
+> Reference: issue #167 (MSI MPG B650 CARBON WIFI, MS-7D74).

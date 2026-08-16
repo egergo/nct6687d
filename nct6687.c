@@ -25,6 +25,7 @@
 #define pr_fmt(fmt) KBUILD_MODNAME ": " fmt
 
 #include <linux/acpi.h>
+#include <linux/bits.h>
 #include <linux/delay.h>
 #include <linux/dmi.h>
 #include <linux/err.h>
@@ -32,11 +33,12 @@
 #include <linux/io.h>
 #include <linux/jiffies.h>
 #include <linux/hwmon.h>
-#include <linux/hwmon-sysfs.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/platform_device.h>
 #include <linux/slab.h>
+#include <linux/version.h>
+#include <linux/workqueue.h>
 
 #define DRVNAME "nct6687"
 
@@ -51,6 +53,7 @@
 #define NCT6687_FAN_CURVE_POINTS 7	   // Number of points in the fan curve registers for each fan.
 #define NCT6687_FAN_CURVE_POINT_SIZE 2 // Each curve point occupies 2 registers
 #define NCT6687_FIRST_SYSTEM_FAN_INDEX 2
+#define NCT6687_FAN_WATCHDOG_MAX_SECONDS 300
 
 /*
  * Fan curve point structure.
@@ -75,12 +78,36 @@ enum kinds
 	nct6687
 };
 
+/*
+ * pwm*_enable values follow the hwmon ABI defined in
+ * Documentation/ABI/testing/sysfs-class-hwmon:
+ *
+ *   1  - manual fan speed control (write pwm*)
+ *   2+ - automatic fan speed control
+ *
+ * NCT668x exposes several automatic profiles internally; this driver
+ * does not currently let userspace pick between them, so 2 simply means
+ * "clear the manual-control bit" and the EC continues running whichever
+ * profile firmware configured.
+ *
+ * The driver previously reported 99 for the auto state and rejected any
+ * write other than 1 or 99. That made standard userspace (lm-sensors
+ * `fancontrol`, ventd, etc.) trip on `-EINVAL` when restoring auto mode
+ * on shutdown. Both values are accepted when writing pwm_enable;
+ * reads always return the ABI-conforming 1 or 2.
+ */
 enum pwm_enable
 {
 	manual_mode = 1,
-	// There are multiple automatic modes, none of which is configurable by this module yet.
-	firmware_mode = 99,
+	auto_mode = 2,
 };
+
+/*
+ * Legacy auto-mode value historically reported / accepted by this
+ * driver. Still accepted for callers that scripted around the old
+ * behaviour; never reported when reading pwm_enable.
+ */
+#define NCT6687_LEGACY_AUTO_MODE 99
 
 static bool force;
 static bool manual;
@@ -124,7 +151,6 @@ static const char *const nct6687_chip_names[] = {
 #define SIO_NCT6681_ID 0xb270 /* for later */
 #define SIO_NCT6683_ID 0xc730
 #define SIO_NCT6686_ID 0xd440
-#define SIO_NCT6687D_ID 0xd450 /* NCT6687 ???*/
 #define SIO_NCT6687_ID 0xd590
 #define SIO_ID_MASK 0xFFF0
 
@@ -182,7 +208,38 @@ static inline void superio_exit(int ioreg)
 #define NCT6687_NUM_REG_VOLTAGE (sizeof(nct6687_voltage_definition) / sizeof(struct voltage_reg))
 #define NCT6687_NUM_REG_TEMP 7
 #define NCT6687_NUM_REG_FAN 8
+
+/*
+ * Some boards expose extra tachometer-only inputs that have no PWM control
+ * path (e.g. MSI MEG Z890 GODLIKE has a second pump header readable at 0x144
+ * in the msi_alt1 mapping). Those channels get fanN_input/fanN_label but no
+ * pwmN attribute, so all PWM/control arrays stay at NCT6687_NUM_REG_FAN.
+ */
+#define NCT6687_NUM_REG_FAN_MAX 9
 #define NCT6687_NUM_REG_PWM 8
+
+/* Default mask covers the eight PWM-capable channels. Boards that expose the
+ * tachometer-only ninth channel get that bit added once detected. */
+#define NCT6687_FAN_MASK_ALL GENMASK(NCT6687_NUM_REG_FAN_MAX - 1, 0)
+#define NCT6687_FAN_MASK_DEFAULT GENMASK(NCT6687_NUM_REG_FAN - 1, 0)
+/* PWM channels never exceed NCT6687_NUM_REG_FAN */
+#define NCT6687_TEMP_MASK_ALL GENMASK(NCT6687_NUM_REG_TEMP - 1, 0)
+
+/* Sentinel: distinguishes "user did not pass fan_mask" from any real mask.
+ * The effective default is computed once the board is known. */
+#define NCT6687_FAN_MASK_UNSET UINT_MAX
+
+static unsigned int fan_mask = NCT6687_FAN_MASK_UNSET;   // Bit N enables fanN+1/pwmN+1
+static unsigned int temp_mask = NCT6687_TEMP_MASK_ALL; // Bit N enables tempN+1
+
+module_param(fan_mask, uint, 0444);
+MODULE_PARM_DESC(fan_mask, "Bitmask of enabled fan/pwm channels, bit 0 = fan1/pwm1 (default: all channels)");
+
+module_param(temp_mask, uint, 0444);
+MODULE_PARM_DESC(temp_mask, "Bitmask of enabled temperature channels, bit 0 = temp1 (default: all channels)");
+
+#define NCT6687_FAN_ENABLED(x) (fan_mask & BIT(x))
+#define NCT6687_TEMP_ENABLED(x) (temp_mask & BIT(x))
 
 #define NCT6687_REG_TEMP(x) (0x100 + (x) * 2)
 #define NCT6687_REG_VOLTAGE(x) (0x120 + (x) * 2)
@@ -374,6 +431,13 @@ static struct nct6687_fan_config nct6687_fan_config_msi_alt[] = {
 	{.reg_rpm = 0x158, .reg_pwm = 0xE02, .reg_pwm_write = 0xC28, .label = "System Fan #4"},
 	{.reg_rpm = 0x156, .reg_pwm = 0xE01, .reg_pwm_write = 0xC10, .label = "System Fan #5"},
 	{.reg_rpm = 0x154, .reg_pwm = 0xE00, .reg_pwm_write = 0xBF8, .label = "System Fan #6"},
+	/*
+	 * Tachometer-only channel: second pump header (PUMP_SYS Fan 2 in BIOS).
+	 * 0x144 is unused in this mapping since the system fans moved to
+	 * 0x154-0x15E. No PWM control path has been verified for it, so
+	 * reg_pwm/reg_pwm_write are left at 0 and no pwm attribute is created.
+	 */
+	{.reg_rpm = 0x144, .reg_pwm = 0, .reg_pwm_write = 0, .label = "Pump Fan #2"},
 };
 
 enum nct6687_fan_config_type
@@ -388,6 +452,14 @@ enum nct6687_fan_config_type
  *
  * Based on LibreHardwareMonitor NCT6687DR chip detection:
  * https://github.com/LibreHardwareMonitor/LibreHardwareMonitor/blob/master/LibreHardwareMonitorLib/Hardware/Motherboard/Lpc/LpcIO.cs
+ *
+ * NOTE: only NCT6687DR-equipped MSI boards (B840/B850/X870/X870E/Z890) belong
+ * here. Earlier MSI series with the plain NCT6687D chip (B650/B660/X670/Z690/
+ * Z790, etc.) use the *default* register mapping at 0x140-0x14E and must NOT
+ * be added to this list. Forcing fan_config=msi_alt1 on those boards reads
+ * EC offsets 0x154-0x15E which are unused (zero) on non-DR variants, causing
+ * all SYS_FAN inputs to report 0 RPM. See issue #167 for a worked example
+ * on MSI MPG B650 CARBON WIFI (MS-7D74).
  */
 static const struct dmi_system_id nct6687_msi_alt_boards[] = {
 	// B840 Series
@@ -398,6 +470,7 @@ static const struct dmi_system_id nct6687_msi_alt_boards[] = {
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "B850 GAMING PLUS WIFI (MS-7E56)")}},
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "B850 GAMING PLUS WIFI6E (MS-7E80)")}},
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "B850M GAMING PLUS WIFI6E (MS-7E81)")}},
+	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "B850 GAMING PRO WIFI6E (MS-7E89)")}},
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "PRO B850-P WIFI (MS-7E56)")}},
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "PRO B850M-A WIFI (MS-7E66)")}},
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "PRO B850M-P WIFI (MS-7E71)")}},
@@ -407,6 +480,9 @@ static const struct dmi_system_id nct6687_msi_alt_boards[] = {
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "MPG B850I EDGE TI WIFI (MS-7E79)")}},
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "B850MPOWER (MS-7E83)")}},
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "PRO B850-S WIFI6E (MS-7E80)")}},
+
+        // B860 Series
+        {.matches = {DMI_MATCH(DMI_BOARD_NAME, "MAG B860M MORTAR WIFI (MS-7E40)")}},
 
 	// X870 Series
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "X870 GAMING PLUS WIFI (MS-7E47)")}},
@@ -420,6 +496,7 @@ static const struct dmi_system_id nct6687_msi_alt_boards[] = {
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "MEG X870E GODLIKE (MS-7E48)")}},
 
 	// Z890 Series
+	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "MEG Z890 GODLIKE (MS-7E21)")}},
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "MEG Z890 ACE (MS-7E22)")}},
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "MEG Z890M ACE (MS-7E23)")}},
 	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "MPG Z890 CARBON WIFI (MS-7E17)")}},
@@ -436,12 +513,42 @@ static const struct dmi_system_id nct6687_msi_alt_boards[] = {
 static int nct6687_fan_config_type = FAN_CONFIG_DEFAULT; // default
 static struct nct6687_fan_config(*nct6687_fan_config_active) = nct6687_fan_config_default;
 
+/*
+ * Number of fan (tachometer) channels exposed by the active mapping.
+ * PWM/control arrays always stay at NCT6687_NUM_REG_FAN; only mappings that
+ * declare extra tachometer-only channels raise this.
+ */
+/*
+ * Boards with a second pump header whose tachometer is readable at 0x144
+ * in the msi_alt1 mapping. Verified per board - do not add entries without
+ * confirming the reading against the BIOS hardware monitor.
+ */
+static const struct dmi_system_id nct6687_dual_pump_boards[] = {
+	{.matches = {DMI_MATCH(DMI_BOARD_NAME, "MEG Z890 GODLIKE (MS-7E21)")}},
+	{}
+};
+
+static int nct6687_msi_alt_channels(void)
+{
+	if (!dmi_check_system(nct6687_dual_pump_boards))
+		return NCT6687_NUM_REG_FAN;
+
+	/* An explicitly provided mask is always respected; only the default
+	 * gains the extra tachometer bit. */
+	if (fan_mask == NCT6687_FAN_MASK_UNSET)
+		fan_mask = NCT6687_FAN_MASK_DEFAULT | BIT(NCT6687_NUM_REG_FAN);
+
+	return ARRAY_SIZE(nct6687_fan_config_msi_alt);
+}
+
+static int nct6687_fan_channels = NCT6687_NUM_REG_FAN;
+
 static int nct6687_fan_config_op_write_handler(const char *val, const struct kernel_param *kp)
 {
 	char valcp[16];
 	char *s;
 
-	strncpy(valcp, val, 16);
+	strscpy(valcp, val, 16);
 	valcp[15] = '\0';
 
 	s = strstrip(valcp);
@@ -450,11 +557,13 @@ static int nct6687_fan_config_op_write_handler(const char *val, const struct ker
 	{
 		nct6687_fan_config_type = FAN_CONFIG_DEFAULT;
 		nct6687_fan_config_active = nct6687_fan_config_default;
+		nct6687_fan_channels = NCT6687_NUM_REG_FAN;
 	}
 	else if (strcmp(s, "msi_alt1") == 0)
 	{
 		nct6687_fan_config_type = FAN_CONFIG_MSI_ALT1;
 		nct6687_fan_config_active = nct6687_fan_config_msi_alt;
+		nct6687_fan_channels = nct6687_msi_alt_channels();
 	}
 	else
 	{
@@ -466,29 +575,47 @@ static int nct6687_fan_config_op_write_handler(const char *val, const struct ker
 
 static int nct6687_fan_config_op_read_handler(char *buffer, const struct kernel_param *kp)
 {
+	const char *config;
+
 	switch (nct6687_fan_config_type)
 	{
 	case FAN_CONFIG_DEFAULT:
-		strcpy(buffer, "default");
+		config = "default";
 		break;
 
 	case FAN_CONFIG_MSI_ALT1:
-		strcpy(buffer, "msi_alt1");
+		config = "msi_alt1";
 		break;
 
 	default:
-		strcpy(buffer, "error");
+		config = "error";
 		break;
 	}
 
-	return strlen(buffer);
+	return sprintf(buffer, "%s\n", config);
 }
 
 static const struct kernel_param_ops nct6687_fan_config_op_ops = {
 	.set = nct6687_fan_config_op_write_handler,
 	.get = nct6687_fan_config_op_read_handler};
 
-module_param_cb(fan_config, &nct6687_fan_config_op_ops, NULL, 0660);
+/*
+ * fan_config is intentionally a boot-time parameter only (perm 0444 —
+ * world-readable, not writable from sysfs). nct6687_fan_config_active
+ * is a globally-shared pointer that sysfs reader paths dereference
+ * lock-free for every fan/pwm access; allowing runtime writes via
+ * `echo msi_alt1 > /sys/module/nct6687/parameters/fan_config` races
+ * those readers and can produce torn pointer reads on 32-bit hosts
+ * and stale register addresses mid-EC-transaction on 64-bit hosts.
+ *
+ * The .set callback is still wired up because the kernel param core
+ * calls it for `insmod nct6687.ko fan_config=msi_alt1` at module load
+ * time, which is the only point at which switching the active config
+ * is safe (before the platform_device is probed and before any reader
+ * exists).
+ */
+module_param_cb(fan_config, &nct6687_fan_config_op_ops, NULL, 0444);
+MODULE_PARM_DESC(fan_config, "Fan register mapping (default or msi_alt1)");
 
 /* ------------------------------------------------------- */
 struct nct6687_data
@@ -498,24 +625,39 @@ struct nct6687_data
 	enum kinds kind;
 
 	struct device *hwmon_dev;
-	const struct attribute_group *groups[6];
+	const struct attribute_group *extra_groups[2];
 
 	struct mutex update_lock;	/* used to protect sensor updates */
 	struct mutex EC_io_lock;	/* used to protect EC io */
 	bool valid;					/* true if following fields are valid */
 	unsigned long last_updated; /* In jiffies */
 
-	/* Voltage values */
-	s16 voltage[3][NCT6687_NUM_REG_VOLTAGE]; // 0 = current 1 = min 2 = max
+	/*
+	 * Voltage values in mV (hwmon ABI). s32 rather than s16 because a
+	 * 12-bit raw reading multiplied by the +12V definition's multiplier
+	 * of 12 peaks around 49140 mV — past the 32767 ceiling of s16.
+	 * Index 0 = current, 1 = running min, 2 = running max.
+	 */
+	s32 voltage[3][NCT6687_NUM_REG_VOLTAGE];
 
 	/* Temperature values */
 	s32 temperature[3][NCT6687_NUM_REG_TEMP]; // 0 = current 1 = min 2 = max
 
 	/* Fan attribute values */
-	u16 rpm[3][NCT6687_NUM_REG_FAN]; // 0 = current 1 = min 2 = max
+	u16 rpm[3][NCT6687_NUM_REG_FAN_MAX]; // 0 = current 1 = min 2 = max
 	u8 _initialFanControlMode[NCT6687_NUM_REG_FAN];
 	u8 _initialFanPwmCommand[NCT6687_NUM_REG_FAN];
+	u8 _initialFanCurve[NCT6687_NUM_REG_FAN][NCT6687_FAN_CURVE_POINTS];
 	bool _restoreDefaultFanControlRequired[NCT6687_NUM_REG_FAN];
+	/*
+	 * Serializes watchdog state changes with delayed-work operations.
+	 * Lock ordering: fan_watchdog_lock, then update_lock.
+	 */
+	struct mutex fan_watchdog_lock;
+	struct delayed_work fan_watchdog_work;
+	unsigned long fan_watchdog_deadline;
+	unsigned int fan_watchdog_timeout;
+	bool removing; /* Protected by update_lock. */
 
 	u8 pwm[NCT6687_NUM_REG_PWM];
 	enum pwm_enable pwm_enable[NCT6687_NUM_REG_PWM];
@@ -530,69 +672,9 @@ struct nct6687_sio_data
 	enum kinds kind;
 };
 
-struct sensor_device_template
-{
-	struct device_attribute dev_attr;
-	union
-	{
-		struct
-		{
-			u8 nr;
-			u8 index;
-		} s;
-		int index;
-	} u;
-	bool s2; /* true if both index and nr are used */
-};
-
-struct sensor_device_attr_u
-{
-	union
-	{
-		struct sensor_device_attribute a1;
-		struct sensor_device_attribute_2 a2;
-	} u;
-	char name[32];
-};
-
-#define __TEMPLATE_ATTR(_template, _mode, _show, _store) \
-	{                                                    \
-		.attr = {.name = _template, .mode = _mode},      \
-		.show = _show,                                   \
-		.store = _store,                                 \
-	}
-
-#define SENSOR_DEVICE_TEMPLATE(_template, _mode, _show, _store, _index) \
-	{                                                                   \
-		.dev_attr = __TEMPLATE_ATTR(_template, _mode, _show, _store),   \
-		.u.index = _index,                                              \
-		.s2 = false}
-
-#define SENSOR_DEVICE_TEMPLATE_2(_template, _mode, _show, _store,     \
-								 _nr, _index)                         \
-	{                                                                 \
-		.dev_attr = __TEMPLATE_ATTR(_template, _mode, _show, _store), \
-		.u.s.index = _index,                                          \
-		.u.s.nr = _nr,                                                \
-		.s2 = true}
-
-#define SENSOR_TEMPLATE(_name, _template, _mode, _show, _store, _index)                                                        \
-	static struct sensor_device_template sensor_dev_template_##_name = SENSOR_DEVICE_TEMPLATE(_template, _mode, _show, _store, \
-																							  _index)
-
-#define SENSOR_TEMPLATE_2(_name, _template, _mode, _show, _store,                                                                \
-						  _nr, _index)                                                                                           \
-	static struct sensor_device_template sensor_dev_template_##_name = SENSOR_DEVICE_TEMPLATE_2(_template, _mode, _show, _store, \
-																								_nr, _index)
-
-struct sensor_template_group
-{
-	struct sensor_device_template **templates;
-	umode_t (*is_visible)(struct kobject *, struct attribute *, int);
-	int base;
-};
-
-static void nct6687_save_fan_control(struct nct6687_data *data, int index);
+static bool nct6687_save_fan_control(struct nct6687_data *data, int index);
+static bool nct6687_restore_fan_pwm(struct nct6687_data *data, int index);
+static bool nct6687_restore_fan_control(struct nct6687_data *data, int index);
 
 static const char *nct6687_voltage_label(char *buf, int index)
 {
@@ -604,92 +686,27 @@ static const char *nct6687_voltage_label(char *buf, int index)
 	return buf;
 }
 
-static struct attribute_group *nct6687_create_attr_group(struct device *dev, const struct sensor_template_group *tg, int repeat)
-{
-	struct sensor_device_attribute_2 *a2;
-	struct sensor_device_attribute *a;
-	struct sensor_device_template **t;
-	struct sensor_device_attr_u *su;
-	struct attribute_group *group;
-	struct attribute **attrs;
-	int i, j, count;
-
-	if (repeat <= 0)
-		return ERR_PTR(-EINVAL);
-
-	t = tg->templates;
-	for (count = 0; *t; t++, count++)
-		;
-
-	if (count == 0)
-		return ERR_PTR(-EINVAL);
-
-	group = devm_kzalloc(dev, sizeof(*group), GFP_KERNEL);
-	if (group == NULL)
-		return ERR_PTR(-ENOMEM);
-
-	attrs = devm_kcalloc(dev, repeat * count + 1, sizeof(*attrs), GFP_KERNEL);
-	if (attrs == NULL)
-		return ERR_PTR(-ENOMEM);
-
-	su = devm_kzalloc(dev, array3_size(repeat, count, sizeof(*su)), GFP_KERNEL);
-	if (su == NULL)
-		return ERR_PTR(-ENOMEM);
-
-	group->attrs = attrs;
-	group->is_visible = tg->is_visible;
-
-	for (i = 0; i < repeat; i++)
-	{
-		t = tg->templates;
-
-		for (j = 0; *t != NULL; j++)
-		{
-			snprintf(su->name, sizeof(su->name), (*t)->dev_attr.attr.name, tg->base + i);
-
-			if ((*t)->s2)
-			{
-				a2 = &su->u.a2;
-				sysfs_attr_init(&a2->dev_attr.attr);
-				a2->dev_attr.attr.name = su->name;
-				a2->nr = (*t)->u.s.nr + i;
-				a2->index = (*t)->u.s.index;
-				a2->dev_attr.attr.mode = (*t)->dev_attr.attr.mode;
-				a2->dev_attr.show = (*t)->dev_attr.show;
-				a2->dev_attr.store = (*t)->dev_attr.store;
-				*attrs = &a2->dev_attr.attr;
-			}
-			else
-			{
-				a = &su->u.a1;
-				sysfs_attr_init(&a->dev_attr.attr);
-				a->dev_attr.attr.name = su->name;
-				a->index = (*t)->u.index + i;
-				a->dev_attr.attr.mode = (*t)->dev_attr.attr.mode;
-				a->dev_attr.show = (*t)->dev_attr.show;
-				a->dev_attr.store = (*t)->dev_attr.store;
-				*attrs = &a->dev_attr.attr;
-			}
-			attrs++;
-			su++;
-			t++;
-		}
-	}
-
-	return group;
-}
-
 static u16 nct6687_read(struct nct6687_data *data, u16 address)
 {
 	u8 page = (u8)(address >> 8);
 	u8 index = (u8)(address & 0xFF);
 	int res;
+
+	/*
+	 * EC access is a page-select + index-set + data-read sequence on a
+	 * shared 4-byte I/O window. The data read MUST be inside the lock
+	 * with the matching page/index writes — otherwise a concurrent
+	 * nct6687_read() or nct6687_write() from another thread can
+	 * reprogram page/index between our writes and our inb_p, and we
+	 * return data for the wrong register. nct6687_write() already
+	 * holds the lock across its data write; do the same here.
+	 */
 	mutex_lock(&data->EC_io_lock);
 	outb_p(EC_SPACE_PAGE_SELECT, data->addr + EC_SPACE_PAGE_REGISTER_OFFSET);
 	outb_p(page, data->addr + EC_SPACE_PAGE_REGISTER_OFFSET);
 	outb_p(index, data->addr + EC_SPACE_INDEX_REGISTER_OFFSET);
-	mutex_unlock(&data->EC_io_lock);
 	res = inb_p(data->addr + EC_SPACE_DATA_REGISTER_OFFSET);
+	mutex_unlock(&data->EC_io_lock);
 
 	return res;
 }
@@ -738,15 +755,72 @@ static void nct6687_write_all_curve(struct nct6687_data *data, u16 base_address,
 	}
 }
 
+static bool nct6687_uses_msi_fan_curve(int index)
+{
+	return index >= NCT6687_FIRST_SYSTEM_FAN_INDEX &&
+	       nct6687_fan_config_type == FAN_CONFIG_MSI_ALT1 &&
+	       msi_fan_brute_force;
+}
+
+static bool nct6687_curve_matches(struct nct6687_data *data, u16 base_address, u8 value)
+{
+	int i;
+
+	for (i = 0; i < NCT6687_FAN_CURVE_POINTS; i++)
+	{
+		if (nct6687_read(data, base_address + (i * NCT6687_FAN_CURVE_POINT_SIZE)) != value)
+			return false;
+	}
+
+	return true;
+}
+
+static bool nct6687_curve_equals(struct nct6687_data *data, u16 base_address, const u8 *curve)
+{
+	int i;
+
+	for (i = 0; i < NCT6687_FAN_CURVE_POINTS; i++)
+	{
+		if (nct6687_read(data, base_address +
+				 (i * NCT6687_FAN_CURVE_POINT_SIZE)) != curve[i])
+			return false;
+	}
+
+	return true;
+}
+
+static void nct6687_read_curve(struct nct6687_data *data, u16 base_address, u8 *curve)
+{
+	int i;
+
+	for (i = 0; i < NCT6687_FAN_CURVE_POINTS; i++)
+		curve[i] = nct6687_read(data, base_address + (i * NCT6687_FAN_CURVE_POINT_SIZE));
+}
+
+static void nct6687_write_curve(struct nct6687_data *data, u16 base_address, const u8 *curve)
+{
+	int i;
+
+	for (i = 0; i < NCT6687_FAN_CURVE_POINTS; i++)
+		nct6687_write(data, base_address + (i * NCT6687_FAN_CURVE_POINT_SIZE), curve[i]);
+}
+
 static void nct6687_update_temperatures(struct nct6687_data *data)
 {
 	int i;
 
 	for (i = 0; i < NCT6687_NUM_REG_TEMP; i++)
 	{
-		s32 value = (char)nct6687_read(data, NCT6687_REG_TEMP(i));
-		s32 half = (nct6687_read(data, NCT6687_REG_TEMP(i) + 1) >> 7) & 0x1;
-		s32 temperature = (value * 1000) + (500 * half);
+		s32 value;
+		s32 half;
+		s32 temperature;
+
+		if (!NCT6687_TEMP_ENABLED(i))
+			continue;
+
+		value = (char)nct6687_read(data, NCT6687_REG_TEMP(i));
+		half = (nct6687_read(data, NCT6687_REG_TEMP(i) + 1) >> 7) & 0x1;
+		temperature = (value * 1000) + (500 * half);
 
 		data->temperature[0][i] = temperature;
 		data->temperature[1][i] = MIN(temperature, data->temperature[1][i]);
@@ -768,7 +842,12 @@ static void nct6687_update_voltage(struct nct6687_data *data)
 		s16 high = nct6687_read(data, NCT6687_REG_VOLTAGE(reg)) * 16;
 		s16 low = ((u16)nct6687_read(data, NCT6687_REG_VOLTAGE(reg) + 1)) >> 4;
 		s16 value = low + high;
-		s16 voltage = manual ? value : value * nct6687_voltage_definition[index].multiplier;
+		/*
+		 * value (max 4095) * multiplier (12 for +12V rail) reaches
+		 * ~49140 mV, which overflows s16. Use s32 to keep rail values
+		 * correct under worst-case inputs.
+		 */
+		s32 voltage = manual ? value : value * nct6687_voltage_definition[index].multiplier;
 
 		data->voltage[0][index] = voltage;
 		data->voltage[1][index] = MIN(voltage, data->voltage[1][index]);
@@ -787,16 +866,22 @@ static enum pwm_enable nct6687_get_pwm_enable(struct nct6687_data *data, int ind
 	{
 		return manual_mode;
 	}
-	return firmware_mode;
+	return auto_mode;
 }
 
 static void nct6687_update_fans(struct nct6687_data *data)
 {
 	int i;
 
-	for (i = 0; i < NCT6687_NUM_REG_FAN; i++)
+	/* tachometer-only channels included (no PWM state touched here) */
+	for (i = 0; i < nct6687_fan_channels; i++)
 	{
-		s16 rmp = nct6687_read16(data, NCT6687_REG_FAN_RPM(i));
+		s16 rmp;
+
+		if (!NCT6687_FAN_ENABLED(i))
+			continue;
+
+		rmp = nct6687_read16(data, NCT6687_REG_FAN_RPM(i));
 
 		data->rpm[0][i] = rmp;
 		data->rpm[1][i] = MIN(rmp, data->rpm[1][i]);
@@ -807,6 +892,9 @@ static void nct6687_update_fans(struct nct6687_data *data)
 
 	for (i = 0; i < NCT6687_NUM_REG_PWM; i++)
 	{
+		if (!NCT6687_FAN_ENABLED(i))
+			continue;
+
 		data->pwm[i] = nct6687_read(data, NCT6687_REG_PWM(i));
 		data->pwm_enable[i] = nct6687_get_pwm_enable(data, i);
 
@@ -838,148 +926,6 @@ static struct nct6687_data *nct6687_update_device(struct device *dev)
 	mutex_unlock(&data->update_lock);
 
 	return data;
-}
-
-/*
- * Sysfs callback functions
- */
-static ssize_t show_voltage_label(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct sensor_device_attribute *sattr = to_sensor_dev_attr(attr);
-
-	if (manual)
-		return sprintf(buf, "in%d\n", sattr->index);
-	else
-		return sprintf(buf, "%s\n", nct6687_voltage_definition[sattr->index].label);
-}
-
-static ssize_t show_voltage_value(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
-	struct nct6687_data *data = nct6687_update_device(dev);
-
-	return sprintf(buf, "%d\n", data->voltage[sattr->index][sattr->nr]);
-}
-
-static umode_t nct6687_voltage_is_visible(struct kobject *kobj, struct attribute *attr, int index)
-{
-	pr_debug("nct6687_voltage_is_visible[%d], attr=0x%04X\n", index, attr->mode);
-	return attr->mode;
-}
-
-SENSOR_TEMPLATE(voltage_label, "in%d_label", S_IRUGO, show_voltage_label, NULL, 0);
-SENSOR_TEMPLATE_2(voltage_input, "in%d_input", S_IRUGO, show_voltage_value, NULL, 0, 0);
-SENSOR_TEMPLATE_2(voltage_min, "in%d_min", S_IRUGO, show_voltage_value, NULL, 0, 1);
-SENSOR_TEMPLATE_2(voltage_max, "in%d_max", S_IRUGO, show_voltage_value, NULL, 0, 2);
-
-static struct sensor_device_template *nct6687_attributes_voltage_template[] = {
-	&sensor_dev_template_voltage_label,
-	&sensor_dev_template_voltage_input,
-	&sensor_dev_template_voltage_min,
-	&sensor_dev_template_voltage_max,
-	NULL,
-};
-
-static const struct sensor_template_group nct6687_voltage_template_group = {
-	.templates = nct6687_attributes_voltage_template,
-	.is_visible = nct6687_voltage_is_visible,
-};
-
-static ssize_t show_fan_label(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct sensor_device_attribute *sattr = to_sensor_dev_attr(attr);
-
-	return sprintf(buf, "%s\n", nct6687_fan_config_active[sattr->index].label);
-}
-
-static ssize_t show_fan_value(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
-	struct nct6687_data *data = nct6687_update_device(dev);
-
-	return sprintf(buf, "%d\n", data->rpm[sattr->index][sattr->nr]);
-}
-
-static umode_t nct6687_fan_is_visible(struct kobject *kobj, struct attribute *attr, int index)
-{
-	return attr->mode;
-}
-
-SENSOR_TEMPLATE(fan_label, "fan%d_label", S_IRUGO, show_fan_label, NULL, 0);
-SENSOR_TEMPLATE_2(fan_input, "fan%d_input", S_IRUGO, show_fan_value, NULL, 0, 0);
-SENSOR_TEMPLATE_2(fan_min, "fan%d_min", S_IRUGO, show_fan_value, NULL, 0, 1);
-SENSOR_TEMPLATE_2(fan_max, "fan%d_max", S_IRUGO, show_fan_value, NULL, 0, 2);
-
-/*
- * nct6687_fan_is_visible uses the index into the following array
- * to determine if attributes should be created or not.
- * Any change in order or content must be matched.
- */
-static struct sensor_device_template *nct6687_attributes_fan_template[] = {
-	&sensor_dev_template_fan_label,
-	&sensor_dev_template_fan_input,
-	&sensor_dev_template_fan_min,
-	&sensor_dev_template_fan_max,
-	NULL,
-};
-
-static const struct sensor_template_group nct6687_fan_template_group = {
-	.templates = nct6687_attributes_fan_template,
-	.is_visible = nct6687_fan_is_visible,
-	.base = 1,
-};
-
-static ssize_t show_temperature_label(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct sensor_device_attribute *sattr = to_sensor_dev_attr(attr);
-
-	return sprintf(buf, "%s\n", nct6687_temp_label[sattr->index]);
-}
-
-static ssize_t show_temperature_value(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
-	struct nct6687_data *data = nct6687_update_device(dev);
-
-	return sprintf(buf, "%d\n", data->temperature[sattr->index][sattr->nr]);
-}
-
-static umode_t nct6687_temp_is_visible(struct kobject *kobj, struct attribute *attr, int index)
-{
-	return attr->mode;
-}
-
-SENSOR_TEMPLATE(temp_label, "temp%d_label", S_IRUGO, show_temperature_label, NULL, 0);
-SENSOR_TEMPLATE_2(temp_input, "temp%d_input", S_IRUGO, show_temperature_value, NULL, 0, 0);
-SENSOR_TEMPLATE_2(temp_min, "temp%d_min", S_IRUGO, show_temperature_value, NULL, 0, 1);
-SENSOR_TEMPLATE_2(temp_max, "temp%d_max", S_IRUGO, show_temperature_value, NULL, 0, 2);
-
-/*
- * nct6687_temp_is_visible uses the index into the following array
- * to determine if attributes should be created or not.
- * Any change in order or content must be matched.
- */
-static struct sensor_device_template *nct6687_attributes_temp_template[] = {
-	&sensor_dev_template_temp_input,
-	&sensor_dev_template_temp_label,
-	&sensor_dev_template_temp_min,
-	&sensor_dev_template_temp_max,
-	NULL,
-};
-
-static const struct sensor_template_group nct6687_temp_template_group = {
-	.templates = nct6687_attributes_temp_template,
-	.is_visible = nct6687_temp_is_visible,
-	.base = 1,
-};
-
-static ssize_t show_pwm(struct device *dev, struct device_attribute *attr, char *buf)
-{
-	struct nct6687_data *data = nct6687_update_device(dev);
-	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
-	int index = sattr->index;
-
-	return sprintf(buf, "%d\n", data->pwm[index]);
 }
 
 /* Returns true on success and false on timeout. */
@@ -1030,17 +976,18 @@ static bool start_fan_cfg_update(struct nct6687_data *data, int fan)
 	return true;
 }
 
-static void finish_fan_cfg_update(struct nct6687_data *data, int fan)
+static bool finish_fan_cfg_update(struct nct6687_data *data, int fan)
 {
 	int i;
 	u8 engsts;
 	u8 donecmd;
+	bool success = true;
 
 	engsts = nct6687_read(data, NCT6687_REG_FAN_ENGINE_STS);
 	if ((engsts & NCT6687_FAN_CFG_LOCK) || !(engsts & NCT6687_FAN_CFG_PHASE))
 	{
 		pr_warn("Fan registers are already not accessible\n");
-		return;
+		return false;
 	}
 
 	/*
@@ -1063,88 +1010,131 @@ static void finish_fan_cfg_update(struct nct6687_data *data, int fan)
 	}
 
 	if (i == 1000)
+	{
 		pr_err("Failed waiting for new configuration to be accepted\n");
+		success = false;
+	}
 
 	if (engsts & NCT6687_FAN_CFG_INVALID)
+	{
 		pr_warn("The device rejected new configuration as invalid\n");
+		success = false;
+	}
 
 	if (!(engsts & NCT6687_FAN_CFG_LOCK))
+	{
 		pr_warn("Fan registers are still accessible\n");
+		success = false;
+	}
+
+	return success;
 }
 
-static ssize_t store_pwm(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
+static int nct6687_write_pwm(struct device *dev, int index, long val)
 {
-	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
 	struct nct6687_data *data = dev_get_drvdata(dev);
-	int index = sattr->index;
-	unsigned long val;
 	u16 mode;
 	u8 bitMask;
+	bool success;
 
-	if (kstrtoul(buf, 10, &val) || val > 255 || index >= NCT6687_NUM_REG_FAN)
+	if (val < 0 || val > 255 || index >= NCT6687_NUM_REG_FAN)
 		return -EINVAL;
 
 	mutex_lock(&data->update_lock);
+	if (data->removing)
+	{
+		mutex_unlock(&data->update_lock);
+		return -ENODEV;
+	}
 
-	nct6687_save_fan_control(data, index);
+	if (!nct6687_save_fan_control(data, index))
+	{
+		mutex_unlock(&data->update_lock);
+		return -EIO;
+	}
+
+	if (!start_fan_cfg_update(data, index))
+	{
+		mutex_unlock(&data->update_lock);
+		return -EIO;
+	}
 
 	mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
 	bitMask = (u8)(0x01 << index);
-
 	mode = (u8)(mode | bitMask);
 	nct6687_write(data, NCT6687_REG_FAN_CTRL_MODE(index), mode);
 
-	if (start_fan_cfg_update(data, index))
+	if (nct6687_uses_msi_fan_curve(index))
 	{
-		if (index >= NCT6687_FIRST_SYSTEM_FAN_INDEX && nct6687_fan_config_type == FAN_CONFIG_MSI_ALT1 && msi_fan_brute_force)
+		success = nct6687_curve_matches(data, NCT6687_REG_PWM_WRITE(index), val);
+		if (!success)
 		{
-			// For MSI alt boards: Check if current PWM already matches target to avoid unnecessary writes
-			u8 current_pwm = nct6687_read(data, NCT6687_REG_PWM(index));
-			if (current_pwm != val)
-			{
-				nct6687_write_all_curve(data, NCT6687_REG_PWM_WRITE(index), val);
-			}
+			nct6687_write_all_curve(data, NCT6687_REG_PWM_WRITE(index), val);
+			success = nct6687_curve_matches(data, NCT6687_REG_PWM_WRITE(index), val);
 		}
-		else
-		{
-			nct6687_write(data, NCT6687_REG_PWM_WRITE(index), val);
-		}
-		finish_fan_cfg_update(data, index);
+		if (!success)
+			pr_err("Failed to verify MSI fan %d curve write\n", index);
 	}
+	else
+	{
+		nct6687_write(data, NCT6687_REG_PWM_WRITE(index), val);
+		success = nct6687_read(data, NCT6687_REG_PWM_WRITE(index)) == val;
+		if (!success)
+			pr_err("Failed to verify fan %d PWM write\n", index);
+	}
+
+	if (!finish_fan_cfg_update(data, index))
+		success = false;
 
 	data->pwm[index] = nct6687_read(data, NCT6687_REG_PWM(index));
 	data->pwm_enable[index] = nct6687_get_pwm_enable(data, index);
+	if (data->pwm_enable[index] != manual_mode)
+	{
+		pr_err("Failed to verify fan %d manual-control mode\n", index);
+		success = false;
+	}
 
 	mutex_unlock(&data->update_lock);
 
-	return count;
+	return success ? 0 : -EIO;
 }
 
-static ssize_t show_pwm_enable(struct device *dev, struct device_attribute *attr, char *buf)
+static int nct6687_write_pwm_enable(struct device *dev, int index, long val)
 {
-	struct nct6687_data *data = nct6687_update_device(dev);
-	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
-
-	return sprintf(buf, "%d\n", data->pwm_enable[sattr->nr]);
-}
-
-static ssize_t store_pwm_enable(struct device *dev, struct device_attribute *attr, const char *buf, size_t count)
-{
-	struct sensor_device_attribute_2 *sattr = to_sensor_dev_attr_2(attr);
 	struct nct6687_data *data = dev_get_drvdata(dev);
-	int index = sattr->nr;
-	unsigned long val;
 	u16 mode;
 	u8 bitMask;
+	bool restore_pwm = false;
 
-	if (index >= NCT6687_NUM_REG_FAN || kstrtoul(buf, 10, &val))
+	if (index >= NCT6687_NUM_REG_FAN)
 		return -EINVAL;
-	if (val != manual_mode && val != firmware_mode)
+	if (val != manual_mode && val != auto_mode && val != NCT6687_LEGACY_AUTO_MODE)
 		return -EINVAL;
 
 	mutex_lock(&data->update_lock);
+	if (data->removing)
+	{
+		mutex_unlock(&data->update_lock);
+		return -ENODEV;
+	}
 
-	nct6687_save_fan_control(data, index);
+	if (val == manual_mode)
+	{
+		if (!nct6687_save_fan_control(data, index))
+		{
+			mutex_unlock(&data->update_lock);
+			return -EIO;
+		}
+	}
+	else if (data->_restoreDefaultFanControlRequired[index])
+	{
+		restore_pwm = true;
+		if (!nct6687_restore_fan_pwm(data, index))
+		{
+			mutex_unlock(&data->update_lock);
+			return -EIO;
+		}
+	}
 
 	mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
 
@@ -1153,81 +1143,422 @@ static ssize_t store_pwm_enable(struct device *dev, struct device_attribute *att
 	{
 		mode = (u8)(mode | bitMask);
 	}
-	else if (val == firmware_mode)
+	else
 	{
+		/* auto_mode or NCT6687_LEGACY_AUTO_MODE — clear the manual-control bit. */
 		mode = (u8)(mode & ~bitMask);
 	}
 
 	nct6687_write(data, NCT6687_REG_FAN_CTRL_MODE(index), mode);
+	mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
+	if (!!(mode & bitMask) != (val == manual_mode))
+	{
+		pr_err("Failed to verify fan %d control mode\n", index);
+		mutex_unlock(&data->update_lock);
+		return -EIO;
+	}
+
+	if (val != manual_mode)
+	{
+		/* An explicit auto request ends this driver's manual-control session. */
+		data->_restoreDefaultFanControlRequired[index] = false;
+		if (restore_pwm)
+			pr_debug("Restored fan %d PWM state before enabling automatic control\n",
+				 index);
+	}
+
+	/*
+	 * Keep the cached pwm_enable consistent with the register we just wrote
+	 * so the immediate read-back returns the value the user just stored,
+	 * not the previous value cached on the last nct6687_update_device tick.
+	 * Legacy value 99 is normalised to the ABI-conforming auto_mode (2).
+	 */
+	data->pwm_enable[index] = (val == manual_mode) ? manual_mode : auto_mode;
 
 	mutex_unlock(&data->update_lock);
 
-	return count;
+	return 0;
 }
 
-SENSOR_TEMPLATE(pwm, "pwm%d", S_IRUGO, show_pwm, store_pwm, 0);
-SENSOR_TEMPLATE_2(pwm_enable, "pwm%d_enable", S_IRUGO, show_pwm_enable, store_pwm_enable, 0, 0);
-
-static void nct6687_save_fan_control(struct nct6687_data *data, int index)
+static bool nct6687_save_fan_control(struct nct6687_data *data, int index)
 {
-	if (data->_restoreDefaultFanControlRequired[index] == false)
+	u16 reg;
+	u16 bitMask;
+
+	if (data->_restoreDefaultFanControlRequired[index])
+		return true;
+
+	reg = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
+	bitMask = 0x01 << index;
+
+	if (!start_fan_cfg_update(data, index))
+		return false;
+
+	if (nct6687_uses_msi_fan_curve(index))
 	{
-		u16 reg = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
-		u16 bitMask = 0x01 << index;
-		u8 pwm = nct6687_read(data, NCT6687_REG_FAN_PWM_COMMAND(index));
-
-		data->_initialFanControlMode[index] = (u8)(reg & bitMask);
-		data->_initialFanPwmCommand[index] = pwm;
-
-		data->_restoreDefaultFanControlRequired[index] = true;
+		nct6687_read_curve(data, NCT6687_REG_PWM_WRITE(index),
+				   data->_initialFanCurve[index]);
 	}
+	else
+	{
+		data->_initialFanPwmCommand[index] =
+			nct6687_read(data, NCT6687_REG_PWM_WRITE(index));
+	}
+
+	if (!finish_fan_cfg_update(data, index))
+		return false;
+
+	if (nct6687_uses_msi_fan_curve(index))
+		pr_debug("Saved MSI fan %d curve: %*ph\n", index,
+			 NCT6687_FAN_CURVE_POINTS, data->_initialFanCurve[index]);
+	else
+		pr_debug("Saved fan %d PWM target: %u\n", index,
+			 data->_initialFanPwmCommand[index]);
+
+	data->_initialFanControlMode[index] = (u8)(reg & bitMask);
+	data->_restoreDefaultFanControlRequired[index] = true;
+
+	return true;
 }
 
-static void nct6687_restore_fan_control(struct nct6687_data *data, int index)
+static bool nct6687_restore_fan_pwm(struct nct6687_data *data, int index)
+{
+	bool success = true;
+
+	if (!data->_restoreDefaultFanControlRequired[index])
+		return true;
+
+	if (!start_fan_cfg_update(data, index))
+		return false;
+
+	if (nct6687_uses_msi_fan_curve(index))
+	{
+		nct6687_write_curve(data, NCT6687_REG_PWM_WRITE(index),
+				    data->_initialFanCurve[index]);
+		success = nct6687_curve_equals(data, NCT6687_REG_PWM_WRITE(index),
+					       data->_initialFanCurve[index]);
+		if (!success)
+			pr_err("Failed to verify MSI fan %d curve restore\n", index);
+	}
+	else
+	{
+		nct6687_write(data, NCT6687_REG_PWM_WRITE(index),
+			      data->_initialFanPwmCommand[index]);
+		success = nct6687_read(data, NCT6687_REG_PWM_WRITE(index)) ==
+			  data->_initialFanPwmCommand[index];
+		if (!success)
+			pr_err("Failed to verify fan %d PWM restore\n", index);
+	}
+
+	if (!finish_fan_cfg_update(data, index))
+		success = false;
+
+	return success;
+}
+
+static bool nct6687_restore_fan_control(struct nct6687_data *data, int index)
 {
 	if (data->_restoreDefaultFanControlRequired[index])
 	{
 		u8 mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
 		u8 bitMask = 0x01 << index;
+
+		if (!nct6687_restore_fan_pwm(data, index))
+			return false;
+
 		mode = (u8)((mode & ~bitMask) | data->_initialFanControlMode[index]);
-
 		nct6687_write(data, NCT6687_REG_FAN_CTRL_MODE(index), mode);
-
-		if (start_fan_cfg_update(data, index))
+		mode = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(index));
+		if ((mode & bitMask) != data->_initialFanControlMode[index])
 		{
-			// Use same write method as store_pwm: brute force for MSI alt boards, normal write otherwise
-			if (index >= NCT6687_FIRST_SYSTEM_FAN_INDEX && nct6687_fan_config_type == FAN_CONFIG_MSI_ALT1 && msi_fan_brute_force)
-			{
-				nct6687_write_all_curve(data, NCT6687_REG_PWM_WRITE(index), data->_initialFanPwmCommand[index]);
-			}
-			else
-			{
-				nct6687_write(data, NCT6687_REG_PWM_WRITE(index), data->_initialFanPwmCommand[index]);
-			}
-			finish_fan_cfg_update(data, index);
+			pr_err("Failed to verify fan %d control-mode restore\n", index);
+			return false;
 		}
-
 		data->_restoreDefaultFanControlRequired[index] = false;
 
 		pr_debug("nct6687_restore_fan_control[%d], addr=%04X, ctrl=%04X, _initialFanPwmCommand=%d\n", index, NCT6687_REG_FAN_PWM_COMMAND(index), NCT6687_REG_PWM_WRITE(index), data->_initialFanPwmCommand[index]);
 	}
+
+	return true;
 }
 
-static umode_t nct6687_pwm_is_visible(struct kobject *kobj, struct attribute *attr, int index)
+static void nct6687_fan_watchdog_work(struct work_struct *work)
 {
-	return attr->mode | S_IWUSR;
+	struct nct6687_data *data = container_of(to_delayed_work(work),
+						 struct nct6687_data, fan_watchdog_work);
+	unsigned long delay;
+	int failures = 0;
+	int restored = 0;
+	int i;
+
+	mutex_lock(&data->update_lock);
+
+	if (!data->fan_watchdog_timeout)
+	{
+		mutex_unlock(&data->update_lock);
+		return;
+	}
+
+	if (time_before(jiffies, data->fan_watchdog_deadline))
+	{
+		delay = data->fan_watchdog_deadline - jiffies;
+		mutex_unlock(&data->update_lock);
+		mod_delayed_work(system_long_wq, &data->fan_watchdog_work, delay);
+		return;
+	}
+
+	data->fan_watchdog_timeout = 0;
+	for (i = 0; i < NCT6687_NUM_REG_FAN; i++)
+	{
+		if (!data->_restoreDefaultFanControlRequired[i])
+			continue;
+		if (nct6687_restore_fan_control(data, i))
+			restored++;
+		else
+			failures++;
+	}
+
+	mutex_unlock(&data->update_lock);
+
+	if (failures)
+		dev_err(data->hwmon_dev,
+			"fan-control watchdog expired; restored %d channels, failed to restore %d\n",
+			restored, failures);
+	else
+		dev_warn(data->hwmon_dev,
+			 "fan-control watchdog expired; restored %d channels\n", restored);
 }
 
-static struct sensor_device_template *nct6687_attributes_pwm_template[] = {
-	&sensor_dev_template_pwm,
-	&sensor_dev_template_pwm_enable,
+static ssize_t fan_control_watchdog_show(struct device *dev,
+					 struct device_attribute *attr, char *buf)
+{
+	struct nct6687_data *data = dev_get_drvdata(dev);
+	unsigned int timeout;
+
+	mutex_lock(&data->update_lock);
+	timeout = data->fan_watchdog_timeout;
+	mutex_unlock(&data->update_lock);
+
+	return sysfs_emit(buf, "%u\n", timeout);
+}
+
+static ssize_t fan_control_watchdog_store(struct device *dev,
+					  struct device_attribute *attr,
+					  const char *buf, size_t count)
+{
+	struct nct6687_data *data = dev_get_drvdata(dev);
+	unsigned int timeout;
+	int err;
+
+	err = kstrtouint(buf, 10, &timeout);
+	if (err)
+		return err;
+	if (timeout > NCT6687_FAN_WATCHDOG_MAX_SECONDS)
+		return -ERANGE;
+
+	mutex_lock(&data->fan_watchdog_lock);
+	mutex_lock(&data->update_lock);
+	if (data->removing)
+	{
+		mutex_unlock(&data->update_lock);
+		mutex_unlock(&data->fan_watchdog_lock);
+		return -ENODEV;
+	}
+	data->fan_watchdog_timeout = timeout;
+	if (timeout)
+		data->fan_watchdog_deadline = jiffies +
+			msecs_to_jiffies(timeout * MSEC_PER_SEC);
+	mutex_unlock(&data->update_lock);
+
+	if (timeout)
+		mod_delayed_work(system_long_wq, &data->fan_watchdog_work,
+				 msecs_to_jiffies(timeout * MSEC_PER_SEC));
+	else
+		cancel_delayed_work_sync(&data->fan_watchdog_work);
+	mutex_unlock(&data->fan_watchdog_lock);
+
+	return count;
+}
+
+static DEVICE_ATTR_RW(fan_control_watchdog);
+
+static struct attribute *nct6687_fan_watchdog_attrs[] = {
+	&dev_attr_fan_control_watchdog.attr,
 	NULL,
 };
 
-static const struct sensor_template_group nct6687_pwm_template_group = {
-	.templates = nct6687_attributes_pwm_template,
-	.is_visible = nct6687_pwm_is_visible,
-	.base = 1,
+static const struct attribute_group nct6687_fan_watchdog_group = {
+	.attrs = nct6687_fan_watchdog_attrs,
+};
+
+static umode_t nct6687_is_visible(const void *drvdata,
+				  enum hwmon_sensor_types type, u32 attr, int channel)
+{
+	switch (type) {
+	case hwmon_in:
+		return 0444;
+	case hwmon_fan:
+		if (channel >= nct6687_fan_channels || !NCT6687_FAN_ENABLED(channel))
+			return 0;
+		return 0444;
+	case hwmon_temp:
+		return NCT6687_TEMP_ENABLED(channel) ? 0444 : 0;
+	case hwmon_pwm:
+		if (channel >= NCT6687_NUM_REG_PWM || !NCT6687_FAN_ENABLED(channel))
+			return 0;
+		return 0644;
+	default:
+		return 0;
+	}
+}
+
+static int nct6687_read_hwmon(struct device *dev, enum hwmon_sensor_types type,
+			      u32 attr, int channel, long *val)
+{
+	struct nct6687_data *data = nct6687_update_device(dev);
+
+	switch (type) {
+	case hwmon_in:
+		switch (attr) {
+		case hwmon_in_input:
+			*val = data->voltage[0][channel];
+			return 0;
+		case hwmon_in_min:
+			*val = data->voltage[1][channel];
+			return 0;
+		case hwmon_in_max:
+			*val = data->voltage[2][channel];
+			return 0;
+		default:
+			return -EOPNOTSUPP;
+		}
+	case hwmon_fan:
+		switch (attr) {
+		case hwmon_fan_input:
+			*val = data->rpm[0][channel];
+			return 0;
+		case hwmon_fan_min:
+			*val = data->rpm[1][channel];
+			return 0;
+		case hwmon_fan_max:
+			*val = data->rpm[2][channel];
+			return 0;
+		default:
+			return -EOPNOTSUPP;
+		}
+	case hwmon_temp:
+		switch (attr) {
+		case hwmon_temp_input:
+			*val = data->temperature[0][channel];
+			return 0;
+		case hwmon_temp_min:
+			*val = data->temperature[1][channel];
+			return 0;
+		case hwmon_temp_max:
+			*val = data->temperature[2][channel];
+			return 0;
+		default:
+			return -EOPNOTSUPP;
+		}
+	case hwmon_pwm:
+		switch (attr) {
+		case hwmon_pwm_input:
+			*val = data->pwm[channel];
+			return 0;
+		case hwmon_pwm_enable:
+			*val = data->pwm_enable[channel];
+			return 0;
+		default:
+			return -EOPNOTSUPP;
+		}
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static int nct6687_read_string(struct device *dev, enum hwmon_sensor_types type,
+			       u32 attr, int channel, const char **str)
+{
+	static const char *const manual_voltage_labels[] = {
+		"in0", "in1", "in2", "in3", "in4", "in5", "in6",
+		"in7", "in8", "in9", "in10", "in11", "in12", "in13",
+	};
+
+	switch (type) {
+	case hwmon_in:
+		if (attr != hwmon_in_label)
+			return -EOPNOTSUPP;
+		*str = manual ? manual_voltage_labels[channel] :
+			nct6687_voltage_definition[channel].label;
+		return 0;
+	case hwmon_fan:
+		if (attr != hwmon_fan_label)
+			return -EOPNOTSUPP;
+		*str = nct6687_fan_config_active[channel].label;
+		return 0;
+	case hwmon_temp:
+		if (attr != hwmon_temp_label)
+			return -EOPNOTSUPP;
+		*str = nct6687_temp_label[channel];
+		return 0;
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+static int nct6687_write_hwmon(struct device *dev, enum hwmon_sensor_types type,
+			       u32 attr, int channel, long val)
+{
+	if (type != hwmon_pwm)
+		return -EOPNOTSUPP;
+
+	switch (attr) {
+	case hwmon_pwm_input:
+		return nct6687_write_pwm(dev, channel, val);
+	case hwmon_pwm_enable:
+		return nct6687_write_pwm_enable(dev, channel, val);
+	default:
+		return -EOPNOTSUPP;
+	}
+}
+
+#define NCT6687_IN_CONFIG (HWMON_I_INPUT | HWMON_I_MIN | HWMON_I_MAX | HWMON_I_LABEL)
+#define NCT6687_FAN_CONFIG (HWMON_F_INPUT | HWMON_F_MIN | HWMON_F_MAX | HWMON_F_LABEL)
+#define NCT6687_TEMP_CONFIG (HWMON_T_INPUT | HWMON_T_MIN | HWMON_T_MAX | HWMON_T_LABEL)
+#define NCT6687_PWM_CONFIG (HWMON_PWM_INPUT | HWMON_PWM_ENABLE)
+
+static const struct hwmon_channel_info *nct6687_info[] = {
+	HWMON_CHANNEL_INFO(in,
+			   NCT6687_IN_CONFIG, NCT6687_IN_CONFIG, NCT6687_IN_CONFIG,
+			   NCT6687_IN_CONFIG, NCT6687_IN_CONFIG, NCT6687_IN_CONFIG,
+			   NCT6687_IN_CONFIG, NCT6687_IN_CONFIG, NCT6687_IN_CONFIG,
+			   NCT6687_IN_CONFIG, NCT6687_IN_CONFIG, NCT6687_IN_CONFIG,
+			   NCT6687_IN_CONFIG, NCT6687_IN_CONFIG),
+	HWMON_CHANNEL_INFO(fan,
+			   NCT6687_FAN_CONFIG, NCT6687_FAN_CONFIG, NCT6687_FAN_CONFIG,
+			   NCT6687_FAN_CONFIG, NCT6687_FAN_CONFIG, NCT6687_FAN_CONFIG,
+			   NCT6687_FAN_CONFIG, NCT6687_FAN_CONFIG, NCT6687_FAN_CONFIG),
+	HWMON_CHANNEL_INFO(temp,
+			   NCT6687_TEMP_CONFIG, NCT6687_TEMP_CONFIG, NCT6687_TEMP_CONFIG,
+			   NCT6687_TEMP_CONFIG, NCT6687_TEMP_CONFIG, NCT6687_TEMP_CONFIG,
+			   NCT6687_TEMP_CONFIG),
+	HWMON_CHANNEL_INFO(pwm,
+			   NCT6687_PWM_CONFIG, NCT6687_PWM_CONFIG, NCT6687_PWM_CONFIG,
+			   NCT6687_PWM_CONFIG, NCT6687_PWM_CONFIG, NCT6687_PWM_CONFIG,
+			   NCT6687_PWM_CONFIG, NCT6687_PWM_CONFIG),
+	NULL,
+};
+
+static const struct hwmon_ops nct6687_hwmon_ops = {
+	.is_visible = nct6687_is_visible,
+	.read = nct6687_read_hwmon,
+	.read_string = nct6687_read_string,
+	.write = nct6687_write_hwmon,
+};
+
+static const struct hwmon_chip_info nct6687_chip_info = {
+	.ops = &nct6687_hwmon_ops,
+	.info = nct6687_info,
 };
 
 /* Get the monitoring functions started */
@@ -1260,11 +1591,35 @@ static void nct6687_setup_fans(struct nct6687_data *data)
 {
 	int i;
 
+	/*
+	 * Tachometer-only channels (index >= NCT6687_NUM_REG_FAN) have no PWM
+	 * control path, so they are seeded separately below and skipped here.
+	 */
+	for (i = NCT6687_NUM_REG_FAN; i < nct6687_fan_channels; i++) {
+		u16 rpm;
+
+		if (!NCT6687_FAN_ENABLED(i))
+			continue;
+
+		rpm = nct6687_read16(data, NCT6687_REG_FAN_RPM(i));
+
+		data->rpm[0][i] = rpm;
+		data->rpm[1][i] = rpm;
+		data->rpm[2][i] = rpm;
+	}
+
 	for (i = 0; i < NCT6687_NUM_REG_FAN; i++)
 	{
-		u16 reg = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(i));
-		u16 bitMask = 0x01 << i;
-		u16 rpm = nct6687_read16(data, NCT6687_REG_FAN_RPM(i));
+		u16 reg;
+		u16 bitMask;
+		u16 rpm;
+
+		if (!NCT6687_FAN_ENABLED(i))
+			continue;
+
+		reg = nct6687_read(data, NCT6687_REG_FAN_CTRL_MODE(i));
+		bitMask = 0x01 << i;
+		rpm = nct6687_read16(data, NCT6687_REG_FAN_RPM(i));
 
 		data->rpm[0][i] = rpm;
 		data->rpm[1][i] = rpm;
@@ -1288,7 +1643,7 @@ static void nct6687_setup_voltages(struct nct6687_data *data)
 		s16 high = nct6687_read(data, NCT6687_REG_VOLTAGE(reg)) * 16;
 		s16 low = ((u16)nct6687_read(data, NCT6687_REG_VOLTAGE(reg) + 1)) >> 4;
 		s16 value = low + high;
-		s16 voltage = manual ? value : value * nct6687_voltage_definition[index].multiplier;
+		s32 voltage = manual ? value : value * nct6687_voltage_definition[index].multiplier;
 
 		data->voltage[0][index] = voltage;
 		data->voltage[1][index] = voltage;
@@ -1304,9 +1659,16 @@ static void nct6687_setup_temperatures(struct nct6687_data *data)
 
 	for (i = 0; i < NCT6687_NUM_REG_TEMP; i++)
 	{
-		s32 value = (char)nct6687_read(data, NCT6687_REG_TEMP(i));
-		s32 half = (nct6687_read(data, NCT6687_REG_TEMP(i) + 1) >> 7) & 0x1;
-		s32 temperature = (value * 1000) + (5 * half);
+		s32 value;
+		s32 half;
+		s32 temperature;
+
+		if (!NCT6687_TEMP_ENABLED(i))
+			continue;
+
+		value = (char)nct6687_read(data, NCT6687_REG_TEMP(i));
+		half = (nct6687_read(data, NCT6687_REG_TEMP(i) + 1) >> 7) & 0x1;
+		temperature = (value * 1000) + (500 * half);
 
 		data->temperature[0][i] = temperature;
 		data->temperature[1][i] = temperature;
@@ -1322,46 +1684,71 @@ static void nct6687_setup_pwm(struct nct6687_data *data)
 
 	for (i = 0; i < NCT6687_NUM_REG_PWM; i++)
 	{
-		data->_initialFanPwmCommand[i] = nct6687_read(data, NCT6687_REG_FAN_PWM_COMMAND(i));
+		if (!NCT6687_FAN_ENABLED(i))
+			continue;
+
 		data->pwm[i] = nct6687_read(data, NCT6687_REG_PWM(i));
 		data->pwm_enable[i] = nct6687_get_pwm_enable(data, i);
 
-		pr_debug("nct6687_setup_pwm[%d], addr=%04X, pwm=%d, pwm_enable=%d, _initialFanPwmCommand=%d\n",
+		pr_debug("nct6687_setup_pwm[%d], pwm=%d, pwm_enable=%d\n",
 				 i,
-				 NCT6687_REG_FAN_PWM_COMMAND(i),
 				 data->pwm[i],
-				 data->pwm_enable[i],
-				 data->_initialFanPwmCommand[i]);
+				 data->pwm_enable[i]);
 	}
 }
 
+/*
+ * platform_driver.remove's signature changed from
+ *   int  (*remove)(struct platform_device *)
+ * to
+ *   void (*remove)(struct platform_device *)
+ * in 6.11 (kernel commit 0edb555a6).
+ *
+ * Conditionally compile the signature so we can drop the
+ * -Wincompatible-pointer-types pragma from around the
+ * platform_driver struct.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 static int nct6687_remove(struct platform_device *pdev)
+#else
+static void nct6687_remove(struct platform_device *pdev)
+#endif
 {
 	struct device *dev = &pdev->dev;
 	struct nct6687_data *data = dev_get_drvdata(dev);
 	int i;
 
+	/* devm hwmon attributes remain live until after remove returns. */
+	mutex_lock(&data->fan_watchdog_lock);
+	mutex_lock(&data->update_lock);
+	data->removing = true;
+	data->fan_watchdog_timeout = 0;
+	mutex_unlock(&data->update_lock);
+	cancel_delayed_work_sync(&data->fan_watchdog_work);
+	mutex_unlock(&data->fan_watchdog_lock);
+
 	mutex_lock(&data->update_lock);
 
 	for (i = 0; i < NCT6687_NUM_REG_FAN; i++)
 	{
-		nct6687_restore_fan_control(data, i);
+		if (!nct6687_restore_fan_control(data, i))
+			dev_err(dev, "Failed to restore fan %d control state\n", i);
 	}
 
 	mutex_unlock(&data->update_lock);
 
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 11, 0)
 	return 0;
+#endif
 }
 
 static int nct6687_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
 	struct nct6687_sio_data *sio_data = dev->platform_data;
-	struct attribute_group *group;
 	struct nct6687_data *data;
 	struct device *hwmon_dev;
 	struct resource *res;
-	int groups = 0;
 	char build[16];
 
 	res = platform_get_resource(pdev, IORESOURCE_IO, 0);
@@ -1381,15 +1768,31 @@ static int nct6687_probe(struct platform_device *pdev)
 	{
 		nct6687_fan_config_type = FAN_CONFIG_MSI_ALT1;
 		nct6687_fan_config_active = nct6687_fan_config_msi_alt;
+		nct6687_fan_channels = nct6687_msi_alt_channels();
 		dev_info(dev, "Detected MSI board; using alternative fan configuration (msi_alt1)\n");
 		dev_info(dev, "MSI fan brute force mode: %s\n",
 				 msi_fan_brute_force ? "enabled" : "disabled");
 	}
 
+	/*
+	 * Always announce the active fan config so module parameter mismatches
+	 * (e.g. a stale fan_config=msi_alt1 in /etc/modprobe.d/ on a board
+	 * that needs the default mapping) are obvious from dmesg.
+	 */
+	dev_info(dev, "active fan config=%s, SYS_FAN reg_rpm=0x%04X/0x%04X/0x%04X\n",
+		 nct6687_fan_config_type == FAN_CONFIG_MSI_ALT1 ? "msi_alt1" : "default",
+		 nct6687_fan_config_active[2].reg_rpm,
+		 nct6687_fan_config_active[3].reg_rpm,
+		 nct6687_fan_config_active[4].reg_rpm);
+
+	dev_info(dev, "enabled channels: fan/pwm mask=0x%02x, temp mask=0x%02x\n", fan_mask, temp_mask);
+
 	pr_debug("nct6687_probe addr=0x%04X, sioreg=0x%04X\n", data->addr, data->sioreg);
 
 	mutex_init(&data->update_lock);
 	mutex_init(&data->EC_io_lock);
+	mutex_init(&data->fan_watchdog_lock);
+	INIT_DELAYED_WORK(&data->fan_watchdog_work, nct6687_fan_watchdog_work);
 	platform_set_drvdata(pdev, data);
 
 	nct6687_init_device(data);
@@ -1398,48 +1801,32 @@ static int nct6687_probe(struct platform_device *pdev)
 	nct6687_setup_temperatures(data);
 	nct6687_setup_voltages(data);
 
-	/* Register sysfs hooks */
-
-	group = nct6687_create_attr_group(dev, &nct6687_pwm_template_group, NCT6687_NUM_REG_FAN);
-
-	if (IS_ERR(group))
-		return PTR_ERR(group);
-
-	data->groups[groups++] = group;
-
-	group = nct6687_create_attr_group(dev, &nct6687_voltage_template_group, NCT6687_NUM_REG_VOLTAGE);
-
-	if (IS_ERR(group))
-		return PTR_ERR(group);
-
-	data->groups[groups++] = group;
-
-	group = nct6687_create_attr_group(dev, &nct6687_fan_template_group, NCT6687_NUM_REG_FAN);
-
-	if (IS_ERR(group))
-		return PTR_ERR(group);
-
-	data->groups[groups++] = group;
-
-	group = nct6687_create_attr_group(dev, &nct6687_temp_template_group, NCT6687_NUM_REG_TEMP);
-
-	if (IS_ERR(group))
-		return PTR_ERR(group);
-
-	data->groups[groups++] = group;
+	if (nct6687_fan_config_type == FAN_CONFIG_MSI_ALT1 && msi_fan_brute_force)
+		data->extra_groups[0] = &nct6687_fan_watchdog_group;
 
 	scnprintf(build, sizeof(build), "%02d/%02d/%02d", nct6687_read(data, NCT6687_REG_BUILD_MONTH), nct6687_read(data, NCT6687_REG_BUILD_DAY), nct6687_read(data, NCT6687_REG_BUILD_YEAR));
 
 	dev_info(dev, "%s EC firmware version %d.%d build %s\n", nct6687_chip_names[data->kind], nct6687_read(data, NCT6687_REG_VERSION_HI), nct6687_read(data, NCT6687_REG_VERSION_LO), build);
 
-	hwmon_dev = devm_hwmon_device_register_with_groups(dev, nct6687_device_names[data->kind], data, data->groups);
+	hwmon_dev = devm_hwmon_device_register_with_info(
+		dev, nct6687_device_names[data->kind], data,
+		&nct6687_chip_info, data->extra_groups);
+	if (IS_ERR(hwmon_dev))
+		return PTR_ERR(hwmon_dev);
+	data->hwmon_dev = hwmon_dev;
 
-	return PTR_ERR_OR_ZERO(hwmon_dev);
+	return 0;
 }
 
-static int nct6687_suspend(struct platform_device *pdev, pm_message_t state)
+static int nct6687_suspend(struct device *dev)
 {
-	struct nct6687_data *data = nct6687_update_device(&pdev->dev);
+	struct nct6687_data *data = dev_get_drvdata(dev);
+
+	/* Do not let the watchdog access the EC while the device is suspended. */
+	mutex_lock(&data->fan_watchdog_lock);
+	cancel_delayed_work_sync(&data->fan_watchdog_work);
+	mutex_unlock(&data->fan_watchdog_lock);
+	data = nct6687_update_device(dev);
 
 	mutex_lock(&data->update_lock);
 	data->hwm_cfg = nct6687_read(data, NCT6687_HWM_CFG);
@@ -1448,44 +1835,60 @@ static int nct6687_suspend(struct platform_device *pdev, pm_message_t state)
 	return 0;
 }
 
-static int nct6687_resume(struct platform_device *pdev)
+static int nct6687_resume(struct device *dev)
 {
-	struct device *dev = &pdev->dev;
 	struct nct6687_data *data = dev_get_drvdata(dev);
+	unsigned long watchdog_delay = 0;
 
+	mutex_lock(&data->fan_watchdog_lock);
 	mutex_lock(&data->update_lock);
 
 	nct6687_write(data, NCT6687_HWM_CFG, data->hwm_cfg);
 
 	/* Force re-reading all values */
 	data->valid = false;
+	/* jiffies stops in system sleep, preserving the remaining lease. */
+	if (!data->removing && data->fan_watchdog_timeout)
+	{
+		if (time_before(jiffies, data->fan_watchdog_deadline))
+			watchdog_delay = data->fan_watchdog_deadline - jiffies;
+		else
+			watchdog_delay = 1;
+	}
 	mutex_unlock(&data->update_lock);
+
+	if (watchdog_delay)
+		mod_delayed_work(system_long_wq, &data->fan_watchdog_work,
+				 watchdog_delay);
+	mutex_unlock(&data->fan_watchdog_lock);
 
 	return 0;
 }
 
-// static const struct dev_pm_ops nct6687_dev_pm_ops = {
-// 	.suspend = nct6687_suspend,
-// 	.resume = nct6687_resume,
-// 	.freeze = nct6687_suspend,
-// 	.restore = nct6687_resume,
-// };
+/*
+ * Sleep PM ops registered via .driver.pm. The platform_driver.suspend
+ * / .resume slots are deprecated; .driver.pm is the modern dispatch
+ * path in platform_pm_suspend / platform_pm_resume.
+ * The PM helpers also wire freeze/thaw and poweroff/restore, so hibernate uses
+ * the same handlers as S3.
+ */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 1, 0)
+static SIMPLE_DEV_PM_OPS(nct6687_dev_pm_ops, nct6687_suspend, nct6687_resume);
+#define NCT6687_PM_OPS (&nct6687_dev_pm_ops)
+#else
+static DEFINE_SIMPLE_DEV_PM_OPS(nct6687_dev_pm_ops, nct6687_suspend,
+				nct6687_resume);
+#define NCT6687_PM_OPS pm_sleep_ptr(&nct6687_dev_pm_ops)
+#endif
 
-#define NCT6687_DEV_PM_OPS NULL
-
-#pragma GCC diagnostic push
-#pragma GCC diagnostic ignored "-Wincompatible-pointer-types"
 static struct platform_driver nct6687_driver = {
 	.driver = {
 		.name = DRVNAME,
-		.pm = NCT6687_DEV_PM_OPS,
+		.pm = NCT6687_PM_OPS,
 	},
 	.probe = nct6687_probe,
 	.remove = nct6687_remove,
-	.suspend = nct6687_suspend,
-	.resume = nct6687_resume,
 };
-#pragma GCC diagnostic pop
 
 static int __init nct6687_find(int sioaddr, struct nct6687_sio_data *sio_data)
 {
@@ -1510,13 +1913,36 @@ static int __init nct6687_find(int sioaddr, struct nct6687_sio_data *sio_data)
 	case SIO_NCT6686_ID:
 		sio_data->kind = nct6686;
 		break;
-	case SIO_NCT6687D_ID:
 	case SIO_NCT6687_ID:
 		sio_data->kind = nct6687;
 		break;
 	default:
 		if (force)
 		{
+			/*
+			 * Only allow force=1 on chips whose ID is plausibly in the
+			 * Nuvoton NCT668x family (upper nibble 0xD). Other vendors'
+			 * SuperIOs — ITE IT87xx at 0x87xx, Fintek F71xxx at 0x07xx,
+			 * even Nuvoton's own NCT677x at 0xc8xx-0xc9xx — use
+			 * completely different register maps. Forcing the NCT6687
+			 * map onto them at minimum produces nonsense readings and
+			 * at worst writes to unknown control bits that can leave
+			 * the EC in a state the BIOS can no longer recover.
+			 *
+			 * If you reach this branch the right move is usually to
+			 * add the chip ID to the explicit switch above, after
+			 * verifying the register map matches; force is meant for
+			 * experimentation with brand-new NCT668x variants, not
+			 * for cross-vendor attachment.
+			 */
+			if ((val & 0xF000) != 0xD000)
+			{
+				pr_warn("force=1 refused: chip ID 0x%04x is outside the Nuvoton NCT668x range (0xD000-0xDFFF); attach the vendor-appropriate driver instead\n",
+					val);
+				goto fail;
+			}
+			pr_warn("force=1: attaching nct6687 to unrecognised chip ID 0x%04x in the NCT668x range — readings may be incorrect, please file a support request with the board's DMI info\n",
+				val);
 			sio_data->kind = nct6687;
 			break;
 		}
@@ -1582,6 +2008,20 @@ static int __init sensors_nct6687_init(void)
 	int address;
 	int i, err;
 
+	/* Only validate a mask the user actually passed; the sentinel is
+	 * resolved later, once the board (and channel count) is known. */
+	if (fan_mask != NCT6687_FAN_MASK_UNSET && (fan_mask & ~NCT6687_FAN_MASK_ALL))
+	{
+		pr_warn("fan_mask=0x%x has bits above fan%d, ignoring them\n", fan_mask, NCT6687_NUM_REG_FAN_MAX);
+		fan_mask &= NCT6687_FAN_MASK_ALL;
+	}
+
+	if (temp_mask & ~NCT6687_TEMP_MASK_ALL)
+	{
+		pr_warn("temp_mask=0x%x has bits above temp%d, ignoring them\n", temp_mask, NCT6687_NUM_REG_TEMP);
+		temp_mask &= NCT6687_TEMP_MASK_ALL;
+	}
+
 	/* Auto-detect MSI boards that require msi_alt1 configuration */
 	if (nct6687_fan_config_type == FAN_CONFIG_DEFAULT)
 	{
@@ -1590,8 +2030,14 @@ static int __init sensors_nct6687_init(void)
 			pr_info("Detected MSI board requiring msi_alt1 fan configuration\n");
 			nct6687_fan_config_type = FAN_CONFIG_MSI_ALT1;
 			nct6687_fan_config_active = nct6687_fan_config_msi_alt;
+			nct6687_fan_channels = nct6687_msi_alt_channels();
 		}
 	}
+
+	/* Board is known now: resolve the sentinel for every path that did not
+	 * already set an effective mask (default mapping, non-dual-pump boards). */
+	if (fan_mask == NCT6687_FAN_MASK_UNSET)
+		fan_mask = NCT6687_FAN_MASK_DEFAULT;
 
 	err = platform_driver_register(&nct6687_driver);
 	if (err)
@@ -1609,8 +2055,6 @@ static int __init sensors_nct6687_init(void)
 		address = nct6687_find(sioaddr[i], &sio_data);
 		if (address <= 0)
 			continue;
-
-		found = true;
 
 		pdev[i] = platform_device_alloc(DRVNAME, address);
 		if (!pdev[i])
@@ -1646,6 +2090,8 @@ static int __init sensors_nct6687_init(void)
 		err = platform_device_add(pdev[i]);
 		if (err)
 			goto exit_device_put;
+
+		found = true;
 	}
 
 	if (!found)
@@ -1688,6 +2134,7 @@ static void __exit sensors_nct6687_exit(void)
 MODULE_AUTHOR("Frederic Boltz <frederic.boltz@gmail.com>");
 MODULE_DESCRIPTION("Driver for NCT6687D");
 MODULE_LICENSE("GPL");
+MODULE_VERSION("1.0.0");
 
 module_init(sensors_nct6687_init);
 module_exit(sensors_nct6687_exit);
